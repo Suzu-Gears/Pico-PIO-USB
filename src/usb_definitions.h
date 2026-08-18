@@ -73,8 +73,10 @@ typedef struct {
   volatile bool transfer_started;
   volatile bool transfer_aborted;
 
-  uint8_t buffer[(64 + 4) * 2 * 7 / 6 + 2];
-  uint8_t encoded_data_len;
+  // [LOCAL PATCH] scale with PIO_USB_EP_SIZE (was hardcoded 64) and widen the
+  // encoded length to 16 bit so >64-byte isochronous packets fit
+  uint8_t buffer[(PIO_USB_EP_SIZE + 4) * 2 * 7 / 6 + 2];
+  uint16_t encoded_data_len;
   uint8_t failed_count;
 
   uint8_t *app_buf;

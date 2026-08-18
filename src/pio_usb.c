@@ -239,10 +239,13 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
         busy_wait_at_least_cycles(turnaround_in_cycle); // wait for turnaround for LS only
       }
 
-      if (handshake == USB_PID_ACK) {
-        // Only ACK if crc matches
+      if (handshake == USB_PID_ACK || handshake == 0) {
+        // Only accept if crc matches.
+        // [LOCAL PATCH] handshake 0 = isochronous: accept but send no handshake
         if (idx >= 4 && crc_match) {
-          pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
+          if (handshake == USB_PID_ACK) {
+            pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
+          }
           return idx - 4;
         }
       } else if (handshake == USB_PID_NAK) {
@@ -456,15 +459,16 @@ void __no_inline_not_in_flash_func(pio_usb_ll_configure_endpoint)(
 }
 
 // Encode transfer data to 2bit sequence represents TX PIO instruction address
-uint8_t __no_inline_not_in_flash_func(pio_usb_ll_encode_tx_data)(
-    uint8_t const *buffer, uint8_t buffer_len, uint8_t *encoded_data) {
+// [LOCAL PATCH] widened to 16 bit so >64-byte isochronous packets encode correctly
+uint16_t __no_inline_not_in_flash_func(pio_usb_ll_encode_tx_data)(
+    uint8_t const *buffer, uint16_t buffer_len, uint8_t *encoded_data) {
   uint16_t bit_idx = 0;
   int current_state = 1;
   int bit_stuffing = 6;
   for (int idx = 0; idx < buffer_len; idx++) {
     uint8_t data_byte = buffer[idx];
     for (int b = 0; b < 8; b++) {
-      uint8_t byte_idx = bit_idx >> 2;
+      uint16_t byte_idx = bit_idx >> 2;
       encoded_data[byte_idx] <<= 2;
       if (data_byte & (1 << b)) {
         if (current_state) {
@@ -503,7 +507,7 @@ uint8_t __no_inline_not_in_flash_func(pio_usb_ll_encode_tx_data)(
     }
   }
 
-  uint8_t byte_idx = bit_idx >> 2;
+  uint16_t byte_idx = bit_idx >> 2;
   encoded_data[byte_idx] <<= 2;
   encoded_data[byte_idx] |= PIO_USB_TX_ENCODED_DATA_SE0;
   bit_idx++;
@@ -552,6 +556,12 @@ bool __no_inline_not_in_flash_func(pio_usb_ll_transfer_start)(endpoint_t *ep,
   ep->total_len = buflen;
   ep->actual_len = 0;
   ep->failed_count = 0;
+
+  // [LOCAL PATCH] isochronous endpoints always use DATA0 (no handshake ever
+  // toggles it), so pin it here in case a previous transfer flipped it
+  if ((ep->attr & 0x03) == EP_ATTR_ISOCHRONOUS) {
+    ep->data_id = 0;
+  }
 
   if (ep->is_tx) {
     prepare_tx_data(ep);

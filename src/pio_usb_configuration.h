@@ -49,4 +49,10 @@ typedef struct {
 #define PIO_USB_HUB_PORT_CNT 8
 #define PIO_USB_ROOT_PORT_CNT 2
 
-#define PIO_USB_EP_SIZE 64
+// [LOCAL PATCH for USB-Audio-Toolkit] Max transaction size per endpoint.
+// Stock value is 64 (enough for control/interrupt/bulk). Full-speed isochronous
+// audio needs more: 192 bytes = 48 kHz x 16 bit x 2 ch per 1 ms frame.
+// endpoint_t.buffer and prepare_tx_data() scale with this value.
+#ifndef PIO_USB_EP_SIZE
+#define PIO_USB_EP_SIZE 192
+#endif

@@ -537,13 +537,17 @@ bool pio_usb_host_endpoint_abort_transfer(uint8_t root_idx, uint8_t device_addre
 static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
                                                              endpoint_t *ep) {
   int res = 0;
-  uint8_t expect_pid = (ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
+  // [LOCAL PATCH] isochronous: data is always DATA0 and no handshake is sent
+  bool const is_iso = ((ep->attr & 0x03) == EP_ATTR_ISOCHRONOUS);
+  uint8_t expect_pid =
+      (!is_iso && ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
 
   pio_usb_bus_prepare_receive(pp);
   pio_usb_bus_send_token(pp, USB_PID_IN, ep->dev_addr, ep->ep_num);
   pio_usb_bus_start_receive(pp);
 
-  int receive_len = pio_usb_bus_receive_packet_and_handshake(pp, USB_PID_ACK);
+  int receive_len =
+      pio_usb_bus_receive_packet_and_handshake(pp, is_iso ? 0 : USB_PID_ACK);
   uint8_t const receive_pid = pp->usb_rx_buffer[1];
 
   if (receive_len >= 0) {
@@ -558,6 +562,9 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
       }
       memcpy(ep->app_buf, &pp->usb_rx_buffer[2], receive_len);
       pio_usb_ll_transfer_continue(ep, receive_len);
+      if (is_iso) {
+        ep->data_id = 0; // transfer_continue toggled it; iso stays DATA0
+      }
     } else {
       // DATA0/1 mismatched, 0 for re-try next frame
     }
@@ -592,6 +599,16 @@ static int __no_inline_not_in_flash_func(usb_out_transaction)(pio_port_t *pp,
   int res = 0;
 
   uint16_t const xact_len = pio_usb_ll_get_transaction_len(ep);
+
+  // [LOCAL PATCH] isochronous OUT: no handshake follows the data, so send and
+  // complete immediately. The device never ACKs and errors are never retried.
+  if ((ep->attr & 0x03) == EP_ATTR_ISOCHRONOUS) {
+    pio_usb_bus_send_token(pp, USB_PID_OUT, ep->dev_addr, ep->ep_num);
+    pio_usb_bus_usb_transfer(pp, ep->buffer, ep->encoded_data_len);
+    pio_usb_ll_transfer_continue(ep, xact_len);
+    ep->data_id = 0; // transfer_continue toggled it; iso stays DATA0
+    return 0;
+  }
 
   pio_usb_bus_prepare_receive(pp);
   pio_usb_bus_send_token(pp, USB_PID_OUT, ep->dev_addr, ep->ep_num);
