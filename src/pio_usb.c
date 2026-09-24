@@ -36,9 +36,32 @@ static uint8_t nak_encoded[5];
 static uint8_t stall_encoded[5];
 static uint8_t pre_encoded[5];
 
+// Upper bound for the TX completion waits below. The longest packet on a
+// full-speed bus (1023-byte isochronous) takes less than 1 ms, so a wait that
+// is still running after 3 ms means the TX state machine will not get there.
+// These waits run in the SOF timer interrupt; without a bound they would stall
+// the whole application.
+#define PIO_USB_TX_TIMEOUT_US 3000
+
+// Upper bound for receiving one packet. The inter-byte timeout in
+// pio_usb_bus_receive_packet_and_handshake() is restarted on every byte, so a
+// stream of bytes that never ends with an EOP would otherwise keep the loop
+// running forever.
+#define PIO_USB_RX_PACKET_TIMEOUT_US 2000
+
 //--------------------------------------------------------------------+
 // Bus functions
 //--------------------------------------------------------------------+
+
+// Give up on a transmission that did not complete: stop the TX DMA, drop what
+// is left in the FIFO and put the state machine on the instruction that
+// releases the bus, where it stops waiting for the next packet as usual.
+static void __no_inline_not_in_flash_func(tx_abort)(pio_port_t *pp) {
+  dma_channel_abort(pp->tx_ch);
+  pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
+  pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_reset_instr);
+  pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK;
+}
 
 static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   // send PRE token in full-speed
@@ -53,8 +76,12 @@ static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   dma_channel_transfer_from_buffer_now(pp->tx_ch, pre_encoded,
                                        sizeof(pre_encoded));
 
+  uint32_t const t0 = get_time_us_32();
   while ((pp->pio_usb_tx->irq & IRQ_TX_EOP_MASK) == 0) {
-    continue;
+    if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+      tx_abort(pp);
+      break;
+    }
   }
   // Wait for complete transmission of the PRE packet. We don't want to
   // accidentally send trailing Ks in low speed mode due to an early start
@@ -62,7 +89,10 @@ static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   uint32_t stall_mask = 1 << (PIO_FDEBUG_TXSTALL_LSB + pp->sm_tx);
   pp->pio_usb_tx->fdebug = stall_mask; // clear sticky stall mask bit
   while (!(pp->pio_usb_tx->fdebug & stall_mask)) {
-    continue;
+    if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+      tx_abort(pp);
+      break;
+    }
   }
 
   // change bus speed to low-speed
@@ -93,8 +123,12 @@ void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
   pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
 
   io_ro_32 *pc = &pp->pio_usb_tx->sm[pp->sm_tx].addr;
+  uint32_t const t0 = get_time_us_32();
   while ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) == 0) {
-    continue;
+    if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+      tx_abort(pp);
+      return;
+    }
   }
   pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
 
@@ -103,11 +137,17 @@ void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
     // before inter-packet delay timeout, which is 2-bit time by USB specs.
     // For Full speed, our overhead is probably enough without this additional wait.
     while (*pc <= PIO_USB_TX_ENCODED_DATA_COMP) {
-      continue;
+      if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+        tx_abort(pp);
+        return;
+      }
     }
   } else {
     while (*pc < PIO_USB_TX_ENCODED_DATA_COMP) {
-      continue;
+      if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+        tx_abort(pp);
+        return;
+      }
     }
   }
 }
@@ -216,13 +256,17 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
   // Timeout in seven microseconds. That is enough time to receive one byte at low speed.
   // This is to detect packets without an EOP because the device was unplugged.
   uint32_t start = get_time_us_32();
+  uint32_t const packet_start = start;
   while (1) {
     if (pio_sm_get_rx_fifo_level(pio_usb_rx, sm_rx)) {
       uint8_t data = pio_sm_get(pio_usb_rx, sm_rx) >> 24;
-      if (idx < rx_buf_len) {
+      if (idx >= 0 && idx < rx_buf_len) { // idx is signed: never store below the buffer
         usb_rx_buffer[idx] = data;
       }
       start = get_time_us_32(); // reset timeout when a byte is received
+      if (start - packet_start > PIO_USB_RX_PACKET_TIMEOUT_US) {
+        return -1; // bytes keep coming without an EOP
+      }
 
       if (idx >= 2) {
         crc_prev2 = crc_prev;
