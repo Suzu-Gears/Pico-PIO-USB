@@ -36,6 +36,35 @@ static uint8_t nak_encoded[5];
 static uint8_t stall_encoded[5];
 static uint8_t pre_encoded[5];
 
+// [LOCAL PATCH] 送信完了待ちの時間切れ（USB-Audio-Toolkit, 2026-09-24）。
+// 送信ステートマシンがパケットの途中（EOP の後、完了記号の前）でデータ待ちのまま止まることがあり
+// （原因は未特定）、下の待ちループは SOF の割り込みの中で永久に回って loop() を止め、watchdog 再起動に
+// なっていた（治具のソフト watchdog で pio_usb_bus_usb_transfer の *pc < COMP 待ちと特定）。
+// 最長のパケット（ISO 1023 B）でも 1 ms 足らずなので 3 ms で打ち切り、送信 DMA とステートマシンを
+// 立て直して抜ける。そのパケットは応答待ちが時間切れになり、上位（TinyUSB）が再送する。
+// 回数と、打ち切った瞬間の状態は下の変数で読める（アプリ側で表示する）
+#define PIO_USB_TX_TIMEOUT_US 3000
+#define PIO_USB_RX_PACKET_TIMEOUT_US 2000
+volatile uint32_t pio_usb_tx_timeout_count = 0;
+volatile uint32_t pio_usb_rx_timeout_count = 0;  // 受信側: EOP の来ない受信を打ち切った回数
+// [0] 打ち切った待ち（1 = EOP 待ち, 2 = 完了記号待ち, 3/4 = PRE 送信）
+// [1] SM の PC  [2] DMA の残り転送数  [3] DMA の CTRL（bit26 = BUSY）  [4] TX FIFO の段数
+volatile uint32_t pio_usb_tx_timeout_info[5] = {0};
+
+static void __no_inline_not_in_flash_func(tx_timeout_recover)(pio_port_t *pp, uint32_t where) {
+  pio_usb_tx_timeout_info[0] = where;
+  pio_usb_tx_timeout_info[1] = pp->pio_usb_tx->sm[pp->sm_tx].addr;
+  pio_usb_tx_timeout_info[2] = dma_hw->ch[pp->tx_ch].transfer_count;
+  pio_usb_tx_timeout_info[3] = dma_hw->ch[pp->tx_ch].ctrl_trig;
+  pio_usb_tx_timeout_info[4] = pio_sm_get_tx_fifo_level(pp->pio_usb_tx, pp->sm_tx);
+  pio_usb_tx_timeout_count++;
+  dma_channel_abort(pp->tx_ch);
+  pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
+  // 完了記号の位置（set pindirs, 0 = 線を離す）へ飛ばす。その次の out で止まり、通常の待機状態になる
+  pio_sm_exec(pp->pio_usb_tx, pp->sm_tx, pp->tx_reset_instr);
+  pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK;
+}
+
 //--------------------------------------------------------------------+
 // Bus functions
 //--------------------------------------------------------------------+
@@ -53,8 +82,12 @@ static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   dma_channel_transfer_from_buffer_now(pp->tx_ch, pre_encoded,
                                        sizeof(pre_encoded));
 
+  uint32_t const t0 = get_time_us_32();  // [LOCAL PATCH] 時間切れ（ファイル先頭の説明）
   while ((pp->pio_usb_tx->irq & IRQ_TX_EOP_MASK) == 0) {
-    continue;
+    if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+      tx_timeout_recover(pp, 3);
+      break;
+    }
   }
   // Wait for complete transmission of the PRE packet. We don't want to
   // accidentally send trailing Ks in low speed mode due to an early start
@@ -62,7 +95,10 @@ static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   uint32_t stall_mask = 1 << (PIO_FDEBUG_TXSTALL_LSB + pp->sm_tx);
   pp->pio_usb_tx->fdebug = stall_mask; // clear sticky stall mask bit
   while (!(pp->pio_usb_tx->fdebug & stall_mask)) {
-    continue;
+    if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+      tx_timeout_recover(pp, 4);
+      break;
+    }
   }
 
   // change bus speed to low-speed
@@ -93,8 +129,12 @@ void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
   pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
 
   io_ro_32 *pc = &pp->pio_usb_tx->sm[pp->sm_tx].addr;
+  uint32_t const t0 = get_time_us_32();  // [LOCAL PATCH] 時間切れ（ファイル先頭の説明）
   while ((pp->pio_usb_tx->irq & IRQ_TX_ALL_MASK) == 0) {
-    continue;
+    if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+      tx_timeout_recover(pp, 1);
+      return;
+    }
   }
   pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
 
@@ -103,11 +143,17 @@ void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
     // before inter-packet delay timeout, which is 2-bit time by USB specs.
     // For Full speed, our overhead is probably enough without this additional wait.
     while (*pc <= PIO_USB_TX_ENCODED_DATA_COMP) {
-      continue;
+      if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+        tx_timeout_recover(pp, 2);
+        return;
+      }
     }
   } else {
     while (*pc < PIO_USB_TX_ENCODED_DATA_COMP) {
-      continue;
+      if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
+        tx_timeout_recover(pp, 2);
+        return;
+      }
     }
   }
 }
@@ -216,13 +262,22 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
   // Timeout in seven microseconds. That is enough time to receive one byte at low speed.
   // This is to detect packets without an EOP because the device was unplugged.
   uint32_t start = get_time_us_32();
+  uint32_t const packet_start = start;  // [LOCAL PATCH] パケット全体の上限（下の説明）
   while (1) {
     if (pio_sm_get_rx_fifo_level(pio_usb_rx, sm_rx)) {
       uint8_t data = pio_sm_get(pio_usb_rx, sm_rx) >> 24;
-      if (idx < rx_buf_len) {
+      if (idx >= 0 && idx < rx_buf_len) {  // [LOCAL PATCH] idx が桁あふれで負になっても手前を書かない
         usb_rx_buffer[idx] = data;
       }
       start = get_time_us_32(); // reset timeout when a byte is received
+      // [LOCAL PATCH] 上の 7 us の時間切れはバイトが届くたびに延長されるので、EOP の来ないままバイトが
+      // 届き続けると（線の雑音、電源投入直後の DUT）永久に回る。治具ではこれが SOF 割り込みの中で起き、
+      // loop() が止まって watchdog 再起動になった（2026-09-24、ソフト watchdog で特定）。
+      // FS の最長パケット（ISO 1023 B）でも 1 ms 足らずなので、パケット全体に 2 ms の上限を設ける
+      if (start - packet_start > PIO_USB_RX_PACKET_TIMEOUT_US) {
+        pio_usb_rx_timeout_count++;
+        return -1;
+      }
 
       if (idx >= 2) {
         crc_prev2 = crc_prev;
