@@ -138,18 +138,28 @@ void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
   }
   pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK; // clear complete flag
 
+  // [LOCAL PATCH] 完了記号の待ちは「pc を見る」だけだと取りこぼす（USB-Audio-Toolkit, 2026-09-25）。
+  // usb_tx.pio では SE0（EOP）の後、SM は完了記号（アドレス 2）→ out（3）→ 詰め物の K（1）と進み、
+  // TX FIFO が空になると pc=1 の out で止まる。これが正常な終わり方で、pc が 2〜3 にいるのは 8 サイクル
+  // （フルスピードで約 170 ns）しかない。下のループの 1 周がそれより長くなる（割り込み・バスの取り合い・
+  // 時間切れのための時刻読み）とその窓を見逃し、正常に送り終えた SM を pc=1 のまま待ち続けていた
+  // （2026-09-24 に入れた 3 ms の時間切れの正体。打ち切り時の記録 wait=2 sm_pc=1 dma_left=0 fifo=0 は正常終了の状態）。
+  // そこで、EOP の後に TX FIFO が尽きて止まった（FDEBUG の TXSTALL）ことでも完了とみなす。詰め物は完了記号の後に
+  // しか無いので、EOP の後の停止は完了記号を通り過ぎた印になる（send_pre の PRE の待ちと同じ方法）
+  uint32_t const stall_mask = 1u << (PIO_FDEBUG_TXSTALL_LSB + pp->sm_tx);
+  pp->pio_usb_tx->fdebug = stall_mask;  // EOP より前（送り始め）の停止は数えない
   if (pp->low_speed) {
     // For Low speed host, wait until EOP is fully sent. Otherwise, we can send another packet
     // before inter-packet delay timeout, which is 2-bit time by USB specs.
     // For Full speed, our overhead is probably enough without this additional wait.
-    while (*pc <= PIO_USB_TX_ENCODED_DATA_COMP) {
+    while (*pc <= PIO_USB_TX_ENCODED_DATA_COMP && !(pp->pio_usb_tx->fdebug & stall_mask)) {
       if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
         tx_timeout_recover(pp, 2);
         return;
       }
     }
   } else {
-    while (*pc < PIO_USB_TX_ENCODED_DATA_COMP) {
+    while (*pc < PIO_USB_TX_ENCODED_DATA_COMP && !(pp->pio_usb_tx->fdebug & stall_mask)) {
       if (get_time_us_32() - t0 > PIO_USB_TX_TIMEOUT_US) {
         tx_timeout_recover(pp, 2);
         return;
@@ -506,6 +516,12 @@ void __no_inline_not_in_flash_func(pio_usb_ll_configure_endpoint)(
     endpoint_t *ep, uint8_t const *desc_endpoint) {
   const endpoint_descriptor_t *d = (const endpoint_descriptor_t *)desc_endpoint;
   ep->size = d->max_size[0] | (d->max_size[1] << 8);
+  // [LOCAL PATCH] the TX staging buffer (prepare_tx_data) and ep->buffer hold PIO_USB_EP_SIZE bytes.
+  // A larger wMaxPacketSize used to overflow them (a 196-byte isochronous packet with the default
+  // 192); clamp so a big endpoint gets truncated packets instead of a corrupted stack
+  if (ep->size > PIO_USB_EP_SIZE) {
+    ep->size = PIO_USB_EP_SIZE;
+  }
   ep->ep_num = d->epaddr;
   ep->attr = d->attr;
   ep->interval = d->interval;

@@ -277,6 +277,9 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
     }
   }
 
+  // [LOCAL PATCH] application hook: the SOF is out, no transaction yet
+  pio_usb_host_frame_begin_cb(sof_count);
+
   // Carry out all queued endpoint transaction
   for (int root_idx = 0; root_idx < PIO_USB_ROOT_PORT_CNT; root_idx++) {
     root_port_t *root = PIO_USB_ROOT_PORT(root_idx);
@@ -343,6 +346,11 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
     }
   }
 
+  // [LOCAL PATCH] application hook: all transactions of this frame are done. It may take the
+  // results of its own endpoints (pio_usb_host_endpoint_take_result) before the host stack
+  // below sees them, and queue the next packet
+  pio_usb_host_frame_end_cb(sof_count);
+
   // Invoke IRQHandler if interrupt status is set
   for (uint8_t root_idx = 0; root_idx < PIO_USB_ROOT_PORT_CNT; root_idx++) {
     if (PIO_USB_ROOT_PORT(root_idx)->ints) {
@@ -375,6 +383,11 @@ static bool __no_inline_not_in_flash_func(sof_timer)(repeating_timer_t *_rt) {
 uint32_t pio_usb_host_get_frame_number(void) {
   return sof_count;
 }
+
+// [LOCAL PATCH] isochronous streaming inside the SOF interrupt (see pio_usb.h)
+__attribute__((weak)) void pio_usb_host_frame_begin_cb(uint32_t frame) { (void)frame; }
+__attribute__((weak)) void pio_usb_host_frame_end_cb(uint32_t frame) { (void)frame; }
+
 
 void pio_usb_host_port_reset_start(uint8_t root_idx) {
   root_port_t *root = PIO_USB_ROOT_PORT(root_idx);
@@ -450,6 +463,44 @@ bool pio_usb_host_endpoint_open(uint8_t root_idx, uint8_t device_address,
   }
 
   return false;
+}
+
+// [LOCAL PATCH] isochronous streaming helpers (see pio_usb.h). Placed after _find_ep()
+int __no_inline_not_in_flash_func(pio_usb_host_endpoint_take_result)(
+    uint8_t root_idx, uint8_t device_address, uint8_t ep_address, uint16_t *actual_len) {
+  endpoint_t *ep = _find_ep(root_idx, device_address, ep_address);
+  if (!ep) {
+    return 0;
+  }
+  root_port_t *rport = PIO_USB_ROOT_PORT(root_idx);
+  uint32_t const mask = 1u << (ep - pio_usb_ep_pool);
+  int result = 0;
+  if (rport->ep_complete & mask) {
+    rport->ep_complete &= ~mask;
+    result = 1;
+  } else if (rport->ep_error & mask) {
+    rport->ep_error &= ~mask;
+    result = -1;
+  } else if (rport->ep_stalled & mask) {
+    rport->ep_stalled &= ~mask;
+    result = -2;
+  }
+  if (result != 0 && actual_len) {
+    *actual_len = ep->actual_len;
+  }
+  return result;
+}
+
+bool __no_inline_not_in_flash_func(pio_usb_host_endpoint_busy)(
+    uint8_t root_idx, uint8_t device_address, uint8_t ep_address) {
+  endpoint_t *ep = _find_ep(root_idx, device_address, ep_address);
+  return ep && ep->has_transfer;
+}
+
+void __no_inline_not_in_flash_func(pio_usb_host_set_frame_period_us)(uint32_t period_us) {
+  // repeating_timer: a negative delay means "period from the previous target", and the SDK reads
+  // it again after every callback, so this changes the length of the next frame
+  sof_rt.delay_us = -(int64_t)period_us;
 }
 
 bool pio_usb_host_endpoint_close(uint8_t root_idx, uint8_t device_address,
