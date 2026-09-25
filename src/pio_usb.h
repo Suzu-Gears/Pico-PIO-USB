@@ -22,8 +22,10 @@ void pio_usb_host_frame(void);
 // [LOCAL PATCH] Isochronous streaming inside the SOF interrupt (USB-Audio-Toolkit's passthrough
 // audio relay). The two hooks are weak no-ops; an application defines them to move one packet
 // per frame without waiting for the host stack's task loop.
+//   sof:   just before this frame's SOF goes out (to time the SOF finer than the 1 us timer)
 //   begin: after this frame's SOF went out, before any transaction of the frame
 //   end:   after all transactions of the frame, before the host stack is told about completions
+void pio_usb_host_frame_sof_cb(uint32_t frame);
 void pio_usb_host_frame_begin_cb(uint32_t frame);
 void pio_usb_host_frame_end_cb(uint32_t frame);
 // Result of the endpoint's last transfer, taken exactly once: 1 = complete (*actual_len set),

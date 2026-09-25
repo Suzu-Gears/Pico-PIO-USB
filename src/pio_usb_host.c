@@ -258,6 +258,10 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
     return;
   }
 
+  // [LOCAL PATCH] application hook: just before this frame's SOF goes out. The timer only has 1 us
+  // resolution; an application can wake the timer a little early and wait here for the exact moment
+  pio_usb_host_frame_sof_cb(sof_count);
+
   pio_port_t *pp = PIO_USB_PIO_PORT(0);
 
   // Send SOF
@@ -385,6 +389,7 @@ uint32_t pio_usb_host_get_frame_number(void) {
 }
 
 // [LOCAL PATCH] isochronous streaming inside the SOF interrupt (see pio_usb.h)
+__attribute__((weak)) void pio_usb_host_frame_sof_cb(uint32_t frame) { (void)frame; }
 __attribute__((weak)) void pio_usb_host_frame_begin_cb(uint32_t frame) { (void)frame; }
 __attribute__((weak)) void pio_usb_host_frame_end_cb(uint32_t frame) { (void)frame; }
 
