@@ -135,6 +135,13 @@ void __no_inline_not_in_flash_func(pio_usb_bus_prepare_receive)(const pio_port_t
   pio_sm_restart(pp->pio_usb_rx, pp->sm_rx);
   pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr);
   pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr2);
+  // The edge detector keeps running while the decoder is disabled, so line
+  // activity in the meantime (a device being attached, for example) can leave a
+  // DECODER_TRIGGER pending. The decoder would take it as soon as it is enabled
+  // and shift one bogus bit in front of the next packet: SYNC + ACK is then read
+  // as 0x01 0xa5 (#97). Nothing on the line belongs to the next packet yet, so
+  // any pending trigger is stale: drop it before enabling the decoder.
+  pp->pio_usb_rx->irq = (1u << DECODER_TRIGGER);
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, true);
 }
 
