@@ -39,6 +39,50 @@ static uint8_t keepalive_encoded[1];
 
 static bool sof_timer(repeating_timer_t *_rt);
 
+// [LOCAL PATCH] endpoint 0 transaction trace (USB-Audio-Toolkit, see pio_usb.h)
+pio_usb_ep0_trace_t pio_usb_ep0_trace[PIO_USB_EP0_TRACE_LEN];
+volatile uint32_t pio_usb_ep0_trace_count = 0;
+volatile uint32_t pio_usb_ep0_trace_stop_at = 0xffffffffu;
+static uint8_t ep0_eop_pc;  // set by ep0_begin()
+static uint8_t ep0_irq0;    // set by ep0_begin()
+
+static void __no_inline_not_in_flash_func(ep0_trace)(const pio_port_t *pp, const endpoint_t *ep,
+                                                     uint8_t token, uint8_t expect_pid,
+                                                     uint8_t got_pid, int len, int res) {
+  uint32_t const n = pio_usb_ep0_trace_count;
+  if (n >= pio_usb_ep0_trace_stop_at) {
+    return;
+  }
+  pio_usb_ep0_trace_t *t = &pio_usb_ep0_trace[n % PIO_USB_EP0_TRACE_LEN];
+  if (token == USB_PID_SETUP && ep->app_buf) {
+    memcpy(t->setup, ep->app_buf, 8);
+  } else {
+    memset(t->setup, 0, 8);
+  }
+  t->time_us = get_time_us_32();
+  t->frame = sof_count;
+  t->dev_addr = ep->dev_addr;
+  t->token = token;
+  t->expect_pid = expect_pid;
+  t->got_pid = got_pid;
+  t->len = (int16_t)len;
+  t->res = (int8_t)res;
+  t->failed = ep->failed_count;
+  t->rx_irq = (uint8_t)(pp->pio_usb_rx->irq & IRQ_RX_ALL_MASK);
+  t->rx[0] = pp->usb_rx_buffer[0];
+  t->rx[1] = pp->usb_rx_buffer[1];
+  t->eop_pc = ep0_eop_pc;
+  t->irq0 = ep0_irq0;
+  pio_usb_ep0_trace_count = n + 1;
+}
+
+// the start of an endpoint 0 transaction: note the edge detector's state and tell the application
+static inline __force_inline void ep0_begin(const pio_port_t *pp, const endpoint_t *ep, uint8_t token) {
+  ep0_eop_pc = (uint8_t)(pio_sm_get_pc(pp->pio_usb_rx, pp->sm_eop) - pp->offset_eop);
+  ep0_irq0 = (uint8_t)pp->pio_usb_rx->irq;
+  pio_usb_host_ep0_transaction_cb(token, ep->dev_addr);
+}
+
 //--------------------------------------------------------------------+
 // Application API
 //--------------------------------------------------------------------+
@@ -392,6 +436,11 @@ uint32_t pio_usb_host_get_frame_number(void) {
 __attribute__((weak)) void pio_usb_host_frame_sof_cb(uint32_t frame) { (void)frame; }
 __attribute__((weak)) void pio_usb_host_frame_begin_cb(uint32_t frame) { (void)frame; }
 __attribute__((weak)) void pio_usb_host_frame_end_cb(uint32_t frame) { (void)frame; }
+// [LOCAL PATCH] start of an endpoint 0 transaction (see pio_usb.h)
+__attribute__((weak)) void pio_usb_host_ep0_transaction_cb(uint8_t token, uint8_t dev_addr) {
+  (void)token;
+  (void)dev_addr;
+}
 
 
 void pio_usb_host_port_reset_start(uint8_t root_idx) {
@@ -598,6 +647,9 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
   uint8_t expect_pid =
       (!is_iso && ep->data_id == 1) ? USB_PID_DATA1 : USB_PID_DATA0;
 
+  if ((ep->ep_num & 0x7f) == 0) {
+    ep0_begin(pp, ep, USB_PID_IN); // [LOCAL PATCH] see pio_usb.h
+  }
   pio_usb_bus_prepare_receive(pp);
   pio_usb_bus_send_token(pp, USB_PID_IN, ep->dev_addr, ep->ep_num);
   pio_usb_bus_start_receive(pp);
@@ -643,6 +695,12 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
     ep->failed_count = 0; // reset failed count if we got a sound response
   }
 
+  // [LOCAL PATCH] endpoint 0 trace (see pio_usb.h). A DATA PID other than expect_pid is the
+  // DATA0/1 mismatch branch above: the packet was ACKed but dropped, and the IN is sent again
+  if ((ep->ep_num & 0x7f) == 0) {
+    ep0_trace(pp, ep, USB_PID_IN, expect_pid, receive_pid, receive_len >= 0 ? receive_len : -1, res);
+  }
+
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, false);
   pp->usb_rx_buffer[0] = 0;
   pp->usb_rx_buffer[1] = 0;
@@ -666,6 +724,9 @@ static int __no_inline_not_in_flash_func(usb_out_transaction)(pio_port_t *pp,
     return 0;
   }
 
+  if (ep->ep_num == 0) {
+    ep0_begin(pp, ep, USB_PID_OUT); // [LOCAL PATCH] see pio_usb.h
+  }
   pio_usb_bus_prepare_receive(pp);
   pio_usb_bus_send_token(pp, USB_PID_OUT, ep->dev_addr, ep->ep_num);
 
@@ -694,6 +755,11 @@ static int __no_inline_not_in_flash_func(usb_out_transaction)(pio_port_t *pp,
     ep->failed_count = 0;// reset failed count if we got a sound response
   }
 
+  // [LOCAL PATCH] endpoint 0 trace (see pio_usb.h)
+  if (ep->ep_num == 0) {
+    ep0_trace(pp, ep, USB_PID_OUT, 0, receive_token, -1, res == 0 ? 0 : (receive_token ? -1 : -2));
+  }
+
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, false);
   pp->usb_rx_buffer[0] = 0;
   pp->usb_rx_buffer[1] = 0;
@@ -704,6 +770,8 @@ static int __no_inline_not_in_flash_func(usb_out_transaction)(pio_port_t *pp,
 static int __no_inline_not_in_flash_func(usb_setup_transaction)(
     pio_port_t *pp,  endpoint_t *ep) {
   int res = 0;
+
+  ep0_begin(pp, ep, USB_PID_SETUP); // [LOCAL PATCH] see pio_usb.h
 
   // Setup token
   pio_usb_bus_prepare_receive(pp);
@@ -732,6 +800,10 @@ static int __no_inline_not_in_flash_func(usb_setup_transaction)(
   if (res == 0) {
     ep->failed_count = 0;// reset failed count if we got a sound response
   }
+
+  // [LOCAL PATCH] endpoint 0 trace (see pio_usb.h)
+  ep0_trace(pp, ep, USB_PID_SETUP, 0, handshake, -1,
+            handshake == USB_PID_ACK ? 0 : (handshake ? -1 : -2));
 
   pp->usb_rx_buffer[1] = 0; // reset buffer
 

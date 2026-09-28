@@ -191,6 +191,14 @@ void __no_inline_not_in_flash_func(pio_usb_bus_prepare_receive)(const pio_port_t
   pio_sm_restart(pp->pio_usb_rx, pp->sm_rx);
   pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr);
   pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr2);
+  // [LOCAL PATCH] 復号器を動かす前に、残っている「1 ビット読め」の合図（DECODER_TRIGGER）を捨てる（USB-Audio-Toolkit, 2026-09-28）。
+  // 端検出の SM は止まらずに線を見続けているので、復号器を止めている間に線が動くと（機器の接続や電源投入）その合図が
+  // 残る。そのまま復号器を動かすと、合図を即座に受けて 1 ビット読み込み、次に受けるパケットの前に余分な 1 ビットが付く。
+  // 実例: 接続直後の最初の SETUP で、機器の ACK（80 D2。空いている PIO で線を取って確認）を 01 A5 と読み、ACK が
+  // 無かったとみなして SETUP を出し直していた。トランザクションの始めに IRQ 旗が 0x1C（合図あり）なら必ずこうなり、
+  // 0x0C（合図なし）なら正しく読めた。SET_ADDRESS を出し直されたイヤホン（001F:1671）は応答段階をせずにアドレスを移した。
+  // 端検出の SM はこの時点で EOP の待ち（irq wait）で止まっているので、捨てた後に新しい合図は来ない
+  pp->pio_usb_rx->irq = (1u << DECODER_TRIGGER);
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, true);
 }
 
